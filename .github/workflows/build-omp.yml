@@ -1,0 +1,165 @@
+name: Build & publish oh-my-pi image
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (e.g. v18.8.6). Empty = latest."
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if the image tag already exists in the registries"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-omp
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_REPO: https://github.com/can1357/oh-my-pi
+  IMAGE: ${{ vars.DOCKERHUB_IMAGE || 'boekhouden/omp' }}
+  GHCR_IMAGE_NAME: ${{ vars.GHCR_IMAGE_NAME || 'omp' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      ghcr_image: ${{ steps.resolve.outputs.ghcr_image }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve latest upstream tag and check registries
+        id: resolve
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          FORCE: ${{ github.event.inputs.force }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+          else
+            # Stable releases only (vX.Y.Z), highest by version sort.
+            tag=$(git ls-remote --tags --refs "$UPSTREAM_REPO" \
+              | awk '{print $2}' | sed 's#^refs/tags/##' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n1)
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::No upstream tag found"; exit 1
+          fi
+          version="${tag#v}"
+          ghcr_image="ghcr.io/${OWNER,,}/${GHCR_IMAGE_NAME}"
+
+          namespace="${IMAGE%%/*}"
+          repo="${IMAGE#*/}"
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/namespaces/${namespace}/repositories/${repo}/tags/${version}")
+          case "$code" in
+            200) hub=yes ;;
+            404) hub=no ;;
+            *) echo "::error::Unexpected Docker Hub response: $code"; exit 1 ;;
+          esac
+
+          if docker manifest inspect "${ghcr_image}:${version}" >/dev/null 2>&1; then
+            ghcr=yes
+          else
+            ghcr=no
+          fi
+
+          echo "Upstream tag: $tag | ${IMAGE}:${version} exists=$hub | ${ghcr_image}:${version} exists=$ghcr"
+          if [ "$hub" = yes ] && [ "$ghcr" = yes ] && [ "${FORCE:-false}" != "true" ]; then
+            build=false
+            echo "\`$version\` already published to Docker Hub and GHCR, nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          else
+            build=true
+            echo "Building \`$version\` from \`$tag\` (Docker Hub exists: $hub, GHCR exists: $ghcr)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "ghcr_image=$ghcr_image"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      GHCR_IMAGE: ${{ needs.check.outputs.ghcr_image }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Checkout upstream oh-my-pi at ${{ needs.check.outputs.tag }}
+        uses: actions/checkout@v7
+        with:
+          repository: can1357/oh-my-pi
+          ref: refs/tags/${{ needs.check.outputs.tag }}
+          path: oh-my-pi
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME || 'boekhouden' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: oh-my-pi
+          file: oh-my-pi/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:latest
+            ${{ env.GHCR_IMAGE }}:${{ env.VERSION }}
+            ${{ env.GHCR_IMAGE }}:latest
+          # image.source points at this repo so GHCR links the package to it.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/can1357/oh-my-pi
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ needs.check.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      - name: Summary
+        run: |
+          {
+            echo "Published:"
+            echo "- \`${IMAGE}:${VERSION}\`, \`${IMAGE}:latest\`"
+            echo "- \`${GHCR_IMAGE}:${VERSION}\`, \`${GHCR_IMAGE}:latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
